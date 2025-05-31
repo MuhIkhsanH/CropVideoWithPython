@@ -1,0 +1,204 @@
+from flask import Flask, request, render_template_string, send_file
+from moviepy.editor import VideoFileClip, AudioFileClip
+import tempfile, os, shutil
+
+app = Flask(__name__)
+UPLOAD = tempfile.gettempdir()
+
+HTML = '''
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"><title>Web Video Editor</title>
+  <style>
+    body { font-family:sans-serif; max-width:800px; margin:20px auto; }
+    h2 { text-align:center; }
+    video { width:100%; max-height:400px; background:#000; margin:10px 0; }
+    label { display:block; margin:8px 0 4px; font-weight:600; }
+    input, button { padding:8px; margin-bottom:10px; }
+    input[type=range] { width:100%; }
+    .row { display:flex; gap:10px; }
+    .row>div { flex:1; }
+    button { background:#007BFF; color:#fff; border:none; cursor:pointer; width: 100%; }
+    button:hover { background:#0056b3; }
+    .status { text-align:center; color:#27ae60; font-weight:600; }
+  </style>
+</head>
+<body>
+  <h2>🎬 Simple Web Video Editor</h2>
+  <label>Pilih Video:</label>
+  <input type="file" id="videoInput" accept="video/*">
+  <video id="preview" controls></video>
+
+  <div class="row">
+    <div>
+      <label>Start: <span id="lblStart">00:00</span></label>
+      <input type="range" id="startSlider" min="0" max="0" step="0.1" value="0">
+      <input type="number" id="startInput" min="0" step="0.1" value="0">
+    </div>
+    <div>
+      <label>End: <span id="lblEnd">00:00</span></label>
+      <input type="range" id="endSlider"   min="0" max="0" step="0.1" value="0">
+      <input type="number" id="endInput"   min="0" step="0.1" value="0">
+    </div>
+  </div>
+
+  <label><input type="checkbox" id="muteChk"> Mute audio asli</label>
+  <label>Tambah Musik (opsional):</label>
+  <input type="file" id="audioInput" accept="audio/*">
+
+  <button id="processBtn">Crop & Process</button>
+  <div class="status" id="status"></div>
+  <div id="result"></div>
+
+  <script>
+    const toMMSS = s => {
+      const m = Math.floor(s/60), ss = Math.floor(s%60);
+      return String(m).padStart(2,'0')+':'+String(ss).padStart(2,'0');
+    };
+
+    const videoInput = document.getElementById('videoInput'),
+          audioInput = document.getElementById('audioInput'),
+          preview    = document.getElementById('preview'),
+          startSl    = document.getElementById('startSlider'),
+          endSl      = document.getElementById('endSlider'),
+          startIn    = document.getElementById('startInput'),
+          endIn      = document.getElementById('endInput'),
+          lblStart   = document.getElementById('lblStart'),
+          lblEnd     = document.getElementById('lblEnd'),
+          muteChk    = document.getElementById('muteChk'),
+          processBtn = document.getElementById('processBtn'),
+          statusDiv  = document.getElementById('status'),
+          resultDiv  = document.getElementById('result');
+
+    let videoFile;
+
+    videoInput.onchange = () => {
+      videoFile = videoInput.files[0];
+      if (!videoFile) return;
+      const url = URL.createObjectURL(videoFile);
+      preview.src = url;
+      preview.onloadedmetadata = () => {
+        const dur = preview.duration, maxInt = Math.floor(dur);
+        [startSl, endSl].forEach(s => s.max = maxInt);
+        [startIn, endIn].forEach(i => i.max = maxInt);
+        endSl.value = endIn.value = maxInt;
+        startSl.value = startIn.value = 0;
+        lblStart.textContent = toMMSS(0);
+        lblEnd.textContent = toMMSS(maxInt);
+      };
+    };
+
+    function syncStart(v){
+      const maxStart = parseFloat(endSl.value)-0.1;
+      v = Math.min(v, maxStart);
+      startSl.value = startIn.value = v;
+      lblStart.textContent = toMMSS(v);
+      preview.currentTime = v;
+    }
+    function syncEnd(v){
+      const minEnd = parseFloat(startSl.value)+0.1;
+      v = Math.max(v, minEnd);
+      endSl.value = endIn.value = v;
+      lblEnd.textContent = toMMSS(v);
+    }
+
+    preview.ontimeupdate = () => {
+      const ct = preview.currentTime;
+      if (ct > parseFloat(endSl.value)) preview.currentTime = parseFloat(startSl.value);
+    };
+
+    startSl.oninput = () => syncStart(parseFloat(startSl.value));
+    endSl.oninput   = () => syncEnd(parseFloat(endSl.value));
+    startIn.onchange = () => syncStart(Math.max(0, parseFloat(startIn.value)));
+    endIn.onchange   = () => syncEnd(Math.min(preview.duration, parseFloat(endIn.value)));
+
+    processBtn.onclick = async () => {
+      if (!videoFile) return alert('Pilih video dulu!');
+      statusDiv.textContent = 'Memproses...';
+      resultDiv.innerHTML = '';
+      const fd = new FormData();
+      fd.append('video', videoFile);
+      fd.append('start', lblStart.textContent);
+      fd.append('end', lblEnd.textContent);
+      if (muteChk.checked) fd.append('mute','on');
+      if (audioInput.files[0]) fd.append('audio', audioInput.files[0]);
+
+      const res = await fetch('/process', { method:'POST', body: fd });
+      if (!res.ok) return statusDiv.textContent = 'Error!';
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      statusDiv.textContent = 'Selesai!';
+      resultDiv.innerHTML = `
+        <h3>Hasil:</h3>
+        <video controls src="${url}"></video>
+        <a href="${url}" download="edited.mp4"><button>Download!</button></a>`;
+    };
+  </script>
+</body>
+</html>
+'''
+
+@app.route('/')
+def index():
+    return render_template_string(HTML)
+
+@app.route('/process', methods=['POST'])
+def process():
+    try:
+        vid = request.files['video']
+        start_str = request.form['start']
+        end_str = request.form['end']
+        mute = 'mute' in request.form
+        aud = request.files.get('audio')
+
+        def ms_to_s(ms):
+            m, s = map(int, ms.split(':'))
+            return m * 60 + s
+
+        start = ms_to_s(start_str)
+        end = ms_to_s(end_str)
+
+        # Save uploaded video to temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmpv:
+            vid.save(tmpv.name)
+            video_path = tmpv.name
+
+        # Load video clip, crop subclip
+        with VideoFileClip(video_path) as clip:
+            subclip = clip.subclip(start, end)
+
+            # Audio handling
+            if aud and aud.filename:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(aud.filename)[-1]) as tmpa:
+                    aud.save(tmpa.name)
+                    with AudioFileClip(tmpa.name) as music:
+                        music_sub = music.subclip(0, subclip.duration)
+                        final_clip = subclip.set_audio(music_sub)
+            elif mute:
+                final_clip = subclip.set_audio(None)
+            else:
+                final_clip = subclip
+
+            # Save output video
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmpout:
+                output_path = tmpout.name
+                # Write video file
+                if mute and not (aud and aud.filename):
+                    final_clip.write_videofile(output_path, codec='libx264', audio=False, verbose=False, logger=None)
+                else:
+                    final_clip.write_videofile(output_path, codec='libx264', audio_codec='aac', verbose=False, logger=None)
+
+        # Clean up temp input video
+        os.unlink(video_path)
+        # If audio file exists, delete it too
+        if aud and aud.filename:
+            os.unlink(tmpa.name)
+
+        return send_file(output_path, mimetype='video/mp4', as_attachment=True)
+    except Exception as e:
+        print("ERROR:", e)
+        return f"Terjadi error: {str(e)}", 500
+
+if __name__ == '__main__':
+    app.run(debug=True)
